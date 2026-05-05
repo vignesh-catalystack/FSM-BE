@@ -2,3 +2,6 @@ vendor/
 .env
 *.log
 node_modules/
+config/*.json
+.env
+vendor/
