@@ -1,0 +1,15 @@
+RewriteEngine On
+
+# Legacy aliases for canonical job endpoints.
+RewriteRule ^archive\.php$ delete.php [L,NC,QSA]
+RewriteRule ^soft_delete\.php$ delete.php [L,NC,QSA]
+RewriteRule ^dashboard_summary\.php$ admin_summary.php [L,NC,QSA]
+RewriteRule ^deleted_jobs\.php$ deleted.php [L,NC,QSA]
+RewriteRule ^list_deleted\.php$ deleted.php [L,NC,QSA]
+
+# Legacy aliases for canonical tracking endpoints.
+RewriteRule ^get_technician_live_status\.php$ ../tracking/live_status.php [L,NC,QSA]
+RewriteRule ^technician_live_status\.php$ ../tracking/live_status.php [L,NC,QSA]
+RewriteRule ^location_history\.php$ ../tracking/location_history.php [L,NC,QSA]
+RewriteRule ^update_location\.php$ ../tracking/update_location.php [L,NC,QSA]
+RewriteRule ^live_location_update\.php$ ../tracking/update_location.php [L,NC,QSA]

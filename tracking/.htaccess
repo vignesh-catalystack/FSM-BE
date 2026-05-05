@@ -1,0 +1,5 @@
+RewriteEngine On
+
+# Legacy aliases for canonical tracking endpoints.
+RewriteRule ^get_technician_locations\.php$ live_status.php [L,NC,QSA]
+RewriteRule ^get_technician_location_history\.php$ location_history.php [L,NC,QSA]
