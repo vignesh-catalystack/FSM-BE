@@ -16,11 +16,6 @@ ensureDeletedJobsTable($pdo);
 $requestedTechnicianId = query_int_value('technician_id');
 $requestedJobId = query_int_value('job_id');
 
-$limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 200;
-$limit = max(20, min($limit, 1000));
-
-$onlyActiveSession = isset($_GET['active_only']) ? (bool)$_GET['active_only'] : false;
-
 // ─────────────────────────────────────────────
 // QUERY BUILD
 // ─────────────────────────────────────────────
@@ -44,13 +39,12 @@ if ($requestedJobId !== null && $requestedJobId > 0) {
     $params[] = $requestedJobId;
 }
 
-// ACTIVE SESSION FILTER
-if ($onlyActiveSession) {
-    $where[] = "s.status = 'active'";
-}
+// LIVE CONDITIONS
+$where[] = "j.status = 'in_progress'";
+$where[] = "s.status = 'active'";
 
-// 🔥 STRICT QUALITY FILTER
-$where[] = "(l.accuracy IS NULL OR l.accuracy <= 25)";
+// 🔥 FRESH WINDOW (aligned with Flutter refresh)
+$where[] = "l.created_at >= (NOW() - INTERVAL 40 SECOND)";
 
 $whereSql = implode(' AND ', $where);
 
@@ -69,17 +63,23 @@ try {
             l.speed,
             l.battery,
             l.is_charging,
-            l.created_at AS captured_at,
-            l.session_id,
+            l.created_at AS updated_at,
+            j.title AS job_title,
             j.status AS status,
+            u.name AS technician_name,
             COALESCE(s.status, 'stopped') AS tracking_status
         FROM job_locations l
+        INNER JOIN (
+            SELECT user_id, job_id, MAX(id) AS max_id
+            FROM job_locations
+            GROUP BY user_id, job_id
+        ) latest ON latest.max_id = l.id
         INNER JOIN jobs j ON j.id = l.job_id
+        LEFT JOIN users u ON u.id = l.user_id
         LEFT JOIN deleted_jobs dj ON dj.job_id = j.id
         LEFT JOIN job_tracking_sessions s ON s.id = l.session_id
         WHERE {$whereSql}
-        ORDER BY l.session_id ASC, l.created_at ASC
-        LIMIT {$limit}
+        ORDER BY l.id DESC
     ";
 
     $stmt = $pdo->prepare($sql);
@@ -87,17 +87,16 @@ try {
     $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
     // ─────────────────────────────────────────────
-    // PATH CLEANING (PER TECHNICIAN + JOB)
+    // CLEAN + NORMALIZE
     // ─────────────────────────────────────────────
-    $clean = [];
-    $prevPoints = [];
+    $final = [];
 
     foreach ($rows as $row) {
 
         $lat = isset($row['latitude']) ? (float)$row['latitude'] : null;
         $lng = isset($row['longitude']) ? (float)$row['longitude'] : null;
 
-        // ❌ INVALID GPS
+        // ❌ REMOVE INVALID / GHOST COORDINATES
         if (
             $lat === null || $lng === null ||
             $lat < -90 || $lat > 90 ||
@@ -107,30 +106,10 @@ try {
             continue;
         }
 
-        $key = $row['technician_id'] . '_' . $row['job_id'];
-
-        $prev = $prevPoints[$key] ?? null;
-
-        if ($prev) {
-            $dist = haversine($prev['lat'], $prev['lng'], $lat, $lng);
-
-            // ❌ JITTER
-            if ($dist < 8) {
-                continue;
-            }
-
-            // ❌ TELEPORT
-            if ($dist > 300) {
-                continue;
-            }
-        }
-
-        // SAVE PREVIOUS
-        $prevPoints[$key] = ['lat' => $lat, 'lng' => $lng];
-
-        // NORMALIZE
         $row['latitude'] = $lat;
         $row['longitude'] = $lng;
+
+        // NORMALIZATION
         $row['accuracy'] = isset($row['accuracy']) ? (float)$row['accuracy'] : null;
         $row['speed'] = isset($row['speed']) ? (float)$row['speed'] : null;
 
@@ -140,42 +119,26 @@ try {
 
         $row['is_charging'] = (bool)($row['is_charging'] ?? false);
 
-        $row['tracking_status'] = $row['tracking_status'] ?? 'stopped';
-        $row['status'] = $row['status'] ?? '';
+        // NOTE:
+        // ❌ DO NOT ADD "is_live"
+        // Flutter handles freshness using updated_at
 
-        // ISO UTC FORMAT
-        $row['captured_at'] = gmdate('c', strtotime($row['captured_at']));
-
-        $clean[] = $row;
+        $final[] = $row;
     }
 
+    // ─────────────────────────────────────────────
+    // RESPONSE
+    // ─────────────────────────────────────────────
     respond_with_json([
         'success' => true,
-        'count' => count($clean),
-        'history' => $clean,
+        'count' => count($final),
+        'data' => $final,
     ]);
 
 } catch (Throwable $exception) {
     respond_with_json([
         'success' => false,
-        'message' => 'Unable to fetch location history',
+        'message' => 'Unable to fetch technician live status',
         'error' => $exception->getMessage(),
     ], 500);
-}
-
-// ─────────────────────────────────────────────
-// HELPER
-// ─────────────────────────────────────────────
-function haversine($lat1, $lon1, $lat2, $lon2): float {
-    $R = 6371000;
-
-    $dLat = deg2rad($lat2 - $lat1);
-    $dLon = deg2rad($lon2 - $lon1);
-
-    $a = sin($dLat/2)**2 +
-         cos(deg2rad($lat1)) *
-         cos(deg2rad($lat2)) *
-         sin($dLon/2)**2;
-
-    return 2 * $R * atan2(sqrt($a), sqrt(1 - $a));
 }

@@ -7,137 +7,154 @@ require_once __DIR__ . '/../jobs/helpers.php';
 
 enforce_method('POST');
 
-// ---------- AUTH ----------
 $user = authenticate($pdo);
 
-// ---------- INPUT (JSON + FORM SUPPORT) ----------
-$sources = request_sources();
+// ─────────────────────────────────────────────
+// INPUT
+// ─────────────────────────────────────────────
+$data = get_json_input();
 
-$jobId = request_int_value($sources, ['job_id']);
-$sessionId = request_int_value($sources, ['session_id']);
+$jobId = isset($data['job_id']) ? (int)$data['job_id'] : 0;
+$lat = isset($data['latitude']) ? (float)$data['latitude'] : null;
+$lng = isset($data['longitude']) ? (float)$data['longitude'] : null;
+$accuracy = isset($data['accuracy']) ? (float)$data['accuracy'] : null;
+$speed = isset($data['speed']) ? (float)$data['speed'] : 0.0;
+$battery = isset($data['battery']) ? (int)$data['battery'] : null;
+$isCharging = isset($data['is_charging']) ? (bool)$data['is_charging'] : false;
+$sessionId = isset($data['session_id']) ? (int)$data['session_id'] : null;
 
-$latitude = request_float_value($sources, ['latitude']);
-$longitude = request_float_value($sources, ['longitude']);
-
-$accuracy = request_float_value($sources, ['accuracy']);
-$speed = request_float_value($sources, ['speed']);
-
-$batteryRaw = request_string_value($sources, ['battery'], '');
-$chargingRaw = request_string_value($sources, ['is_charging'], '');
-$battery = is_numeric($batteryRaw) ? (int)$batteryRaw : null;
-$isCharging = is_numeric($chargingRaw) ? (int)$chargingRaw : 0;
-
-// ---------- VALIDATION ----------
-if ($jobId <= 0 || $latitude === null || $longitude === null) {
-    respond_with_json([
-        'success' => false,
-        'message' => 'Invalid location payload'
-    ], 400);
+// ─────────────────────────────────────────────
+// BASIC VALIDATION
+// ─────────────────────────────────────────────
+if ($jobId <= 0 || $lat === null || $lng === null) {
+    respond_with_json(['success' => false, 'message' => 'Missing required fields'], 422);
 }
 
-// ---------- COORDINATE VALIDATION ----------
-if (
-    $latitude < -90 || $latitude > 90 ||
-    $longitude < -180 || $longitude > 180 ||
-    ($latitude == 0.0 && $longitude == 0.0)
-) {
-    respond_with_json([
-        'success' => true,
-        'skipped' => 'invalid_coordinates'
-    ]);
-}
-
-// ---------- JOB + SESSION VALIDATION ----------
-$stmt = $pdo->prepare("
-    SELECT id, status, assigned_to
-    FROM jobs
-    WHERE id = ? AND assigned_to = ?
-    LIMIT 1
-");
-$stmt->execute([$jobId, (int)$user['id']]);
+// ─────────────────────────────────────────────
+// JOB VALIDATION
+// ─────────────────────────────────────────────
+$stmt = $pdo->prepare("SELECT id, status FROM jobs WHERE id = ?");
+$stmt->execute([$jobId]);
 $job = $stmt->fetch(PDO::FETCH_ASSOC);
 
 if (!$job) {
-    respond_with_json([
-        'success' => false,
-        'message' => 'Job not found for technician'
-    ], 404);
+    respond_with_json(['success' => false, 'message' => 'Job not found'], 404);
 }
 
-$terminalStatuses = ['completed', 'finished', 'closed', 'deleted'];
-$isTerminalJob = in_array($job['status'], $terminalStatuses, true);
+if ($job['status'] !== 'in_progress') {
+    respond_with_json(['success' => true, 'message' => 'Skipped (job not active)']);
+    return;
+}
 
-$session = null;
-if ($sessionId > 0) {
-    $stmt = $pdo->prepare("
-        SELECT id, status
-        FROM job_tracking_sessions
-        WHERE id = ? AND job_id = ? AND user_id = ?
-        LIMIT 1
-    ");
-    $stmt->execute([$sessionId, $jobId, (int)$user['id']]);
+// ─────────────────────────────────────────────
+// ❌ BLOCK DELETED JOBS
+// ─────────────────────────────────────────────
+$stmt = $pdo->prepare("SELECT 1 FROM deleted_jobs WHERE job_id = ? LIMIT 1");
+$stmt->execute([$jobId]);
+
+if ($stmt->fetchColumn()) {
+    respond_with_json(['success' => true, 'message' => 'Skipped (job deleted)']);
+    return;
+}
+
+// ─────────────────────────────────────────────
+// SESSION VALIDATION
+// ─────────────────────────────────────────────
+if ($sessionId) {
+    $stmt = $pdo->prepare("SELECT id, status FROM job_tracking_sessions WHERE id = ?");
+    $stmt->execute([$sessionId]);
     $session = $stmt->fetch(PDO::FETCH_ASSOC);
-}
 
-if (!$session || (!$isTerminalJob && $session['status'] !== 'active')) {
-    $stmt = $pdo->prepare("
-        SELECT id, status
-        FROM job_tracking_sessions
-        WHERE job_id = ? AND user_id = ? AND status = 'active'
-        ORDER BY start_time DESC, id DESC
-        LIMIT 1
-    ");
-    $stmt->execute([$jobId, (int)$user['id']]);
-    $session = $stmt->fetch(PDO::FETCH_ASSOC);
-}
-
-if (!$session) {
-    if ($isTerminalJob) {
-        $stmt = $pdo->prepare("
-            SELECT id, status
-            FROM job_tracking_sessions
-            WHERE job_id = ? AND user_id = ?
-            ORDER BY start_time DESC, id DESC
-            LIMIT 1
-        ");
-        $stmt->execute([$jobId, (int)$user['id']]);
-        $session = $stmt->fetch(PDO::FETCH_ASSOC);
+    if (!$session || $session['status'] !== 'active') {
+        respond_with_json(['success' => true, 'message' => 'Skipped (inactive session)']);
+        return;
     }
 }
 
-if (!$session) {
-    if ($job['status'] !== 'in_progress') {
-        respond_with_json([
-            'success' => false,
-            'message' => 'Accept job before live tracking'
-        ], 409);
+// ─────────────────────────────────────────────
+// GPS VALIDATION
+// ─────────────────────────────────────────────
+
+// invalid coords
+if ($lat == 0.0 && $lng == 0.0) {
+    respond_with_json(['success' => true, 'message' => 'Skipped (invalid coords)']);
+    return;
+}
+
+// out of bounds
+if ($lat < -90 || $lat > 90 || $lng < -180 || $lng > 180) {
+    respond_with_json(['success' => true, 'message' => 'Skipped (out of range)']);
+    return;
+}
+
+// strict accuracy
+if ($accuracy !== null && $accuracy > 25) {
+    respond_with_json(['success' => true, 'message' => 'Skipped (low accuracy)']);
+    return;
+}
+
+// ─────────────────────────────────────────────
+// PREVIOUS POINT (TIME-BASED)
+// ─────────────────────────────────────────────
+$stmt = $pdo->prepare("
+    SELECT latitude, longitude, created_at
+    FROM job_locations
+    WHERE user_id = ? AND job_id = ?
+    ORDER BY created_at DESC
+    LIMIT 1
+");
+$stmt->execute([$user['id'], $jobId]);
+$prev = $stmt->fetch(PDO::FETCH_ASSOC);
+
+if ($prev) {
+    $prevLat = (float)$prev['latitude'];
+    $prevLng = (float)$prev['longitude'];
+
+    $distance = haversine($prevLat, $prevLng, $lat, $lng);
+
+    $prevTime = strtotime($prev['created_at']);
+    $now = time();
+    $timeDiff = max(1, $now - $prevTime);
+
+    $calcSpeed = $distance / $timeDiff;
+
+    // jitter filter
+    if ($distance < 8 && $speed < 0.5) {
+        respond_with_json(['success' => true, 'message' => 'Skipped (jitter)']);
+        return;
     }
 
-    $stmt = $pdo->prepare("
-        INSERT INTO job_tracking_sessions (job_id, user_id, start_time, status)
-        VALUES (?, ?, NOW(), 'active')
-    ");
-    $stmt->execute([$jobId, (int)$user['id']]);
-    $session = [
-        'id' => (int)$pdo->lastInsertId(),
-        'status' => 'active',
-    ];
+    // teleport filter
+    if ($distance > 300) {
+        respond_with_json(['success' => true, 'message' => 'Skipped (teleport)']);
+        return;
+    }
+
+    // unrealistic speed (>180 km/h)
+    if ($calcSpeed > 50) {
+        respond_with_json(['success' => true, 'message' => 'Skipped (invalid speed)']);
+        return;
+    }
+
+    // spam protection
+    if ($timeDiff < 2) {
+        respond_with_json(['success' => true, 'message' => 'Skipped (too frequent)']);
+        return;
+    }
 }
 
-// ---------- ONLY ACTIVE SESSION ----------
-if (!$isTerminalJob && $session['status'] !== 'active') {
-    respond_with_json([
-        'success' => false,
-        'message' => 'Tracking not active'
-    ], 409);
+// ─────────────────────────────────────────────
+// NORMALIZATION
+// ─────────────────────────────────────────────
+if ($battery !== null) {
+    $battery = max(0, min(100, $battery));
 }
 
-$sessionId = (int)$session['id'];
-
-// ---------- INSERT LOCATION ----------
+// ─────────────────────────────────────────────
+// INSERT
+// ─────────────────────────────────────────────
 $stmt = $pdo->prepare("
     INSERT INTO job_locations (
-        session_id,
         job_id,
         user_id,
         latitude,
@@ -146,37 +163,44 @@ $stmt = $pdo->prepare("
         speed,
         battery,
         is_charging,
+        session_id,
         created_at
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NOW())
+    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP())
 ");
 
 $stmt->execute([
-    $sessionId,
     $jobId,
-    (int)$user['id'],
-    $latitude,
-    $longitude,
+    $user['id'],
+    $lat,
+    $lng,
     $accuracy,
     $speed,
-    $battery === null ? null : max(0, min(100, $battery)),
-    $isCharging
+    $battery,
+    $isCharging ? 1 : 0,
+    $sessionId
 ]);
 
-// ---------- UPDATE USER DEVICE STATE ----------
-if ($battery !== null) {
-    $pdo->prepare("
-        UPDATE users
-        SET battery = ?, is_charging = ?
-        WHERE id = ?
-    ")->execute([
-        max(0, min(100, $battery)),
-        $isCharging,
-        (int)$user['id']
-    ]);
-}
-
-// ---------- RESPONSE ----------
+// ─────────────────────────────────────────────
+// RESPONSE
+// ─────────────────────────────────────────────
 respond_with_json([
     'success' => true,
-    'message' => 'Location updated'
+    'message' => 'Location stored'
 ]);
+
+// ─────────────────────────────────────────────
+// HELPER
+// ─────────────────────────────────────────────
+function haversine($lat1, $lon1, $lat2, $lon2): float {
+    $R = 6371000;
+
+    $dLat = deg2rad($lat2 - $lat1);
+    $dLon = deg2rad($lon2 - $lon1);
+
+    $a = sin($dLat/2)**2 +
+         cos(deg2rad($lat1)) *
+         cos(deg2rad($lat2)) *
+         sin($dLon/2)**2;
+
+    return 2 * $R * atan2(sqrt($a), sqrt(1 - $a));
+}

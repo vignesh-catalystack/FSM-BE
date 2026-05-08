@@ -13,6 +13,10 @@ ensure_user_role($user, ['admin', 'manager'], 'Only admin/manager can view dashb
 ensureDeletedJobsTable($pdo);
 
 try {
+
+    // ─────────────────────────────────────────────
+    // USERS SUMMARY
+    // ─────────────────────────────────────────────
     $summaryStmt = $pdo->query("
         SELECT
             COUNT(*) AS total_users,
@@ -20,8 +24,11 @@ try {
             SUM(role = 'technician') AS total_technicians
         FROM users
     ");
-    $summary = $summaryStmt->fetch(PDO::FETCH_ASSOC);
+    $summary = $summaryStmt->fetch(PDO::FETCH_ASSOC) ?: [];
 
+    // ─────────────────────────────────────────────
+    // JOBS SUMMARY (EXCLUDE DELETED)
+    // ─────────────────────────────────────────────
     $jobsStmt = $pdo->query("
         SELECT
             COUNT(*) AS total_jobs,
@@ -30,8 +37,11 @@ try {
         LEFT JOIN deleted_jobs dj ON dj.job_id = j.id
         WHERE dj.job_id IS NULL
     ");
-    $jobs = $jobsStmt->fetch(PDO::FETCH_ASSOC);
+    $jobs = $jobsStmt->fetch(PDO::FETCH_ASSOC) ?: [];
 
+    // ─────────────────────────────────────────────
+    // ACTIVE TRACKING SESSIONS
+    // ─────────────────────────────────────────────
     $activeStmt = $pdo->query("
         SELECT COUNT(*) AS active_sessions
         FROM job_tracking_sessions s
@@ -40,27 +50,31 @@ try {
         WHERE s.status = 'active'
           AND dj.job_id IS NULL
     ");
-    $active = $activeStmt->fetch(PDO::FETCH_ASSOC);
+    $active = $activeStmt->fetch(PDO::FETCH_ASSOC) ?: [];
 
-    // 🔥 IMPORTANT: CLEAN JSON OUTPUT
-    echo json_encode([
+    // ─────────────────────────────────────────────
+    // FINAL RESPONSE (STRICT FORMAT)
+    // ─────────────────────────────────────────────
+    respond_with_json([
         'success' => true,
         'data' => [
-            'total_users' => (int)($summary['total_users'] ?? 0),
-            'total_managers' => (int)($summary['total_managers'] ?? 0),
-            'total_technicians' => (int)($summary['total_technicians'] ?? 0),
-            'total_jobs' => (int)($jobs['total_jobs'] ?? 0),
-            'completed_jobs' => (int)($jobs['completed_jobs'] ?? 0),
-            'active_sessions' => (int)($active['active_sessions'] ?? 0),
-        ]
+            'total_users'        => (int)($summary['total_users'] ?? 0),
+            'total_managers'     => (int)($summary['total_managers'] ?? 0),
+            'total_technicians'  => (int)($summary['total_technicians'] ?? 0),
+            'total_jobs'         => (int)($jobs['total_jobs'] ?? 0),
+            'completed_jobs'     => (int)($jobs['completed_jobs'] ?? 0),
+            'active_sessions'    => (int)($active['active_sessions'] ?? 0),
+        ],
     ]);
-    exit;
 
 } catch (Throwable $exception) {
-    http_response_code(500);
-    echo json_encode([
+
+    // ─────────────────────────────────────────────
+    // ERROR RESPONSE (STANDARDIZED)
+    // ─────────────────────────────────────────────
+    respond_with_json([
         'success' => false,
-        'message' => $exception->getMessage()
-    ]);
-    exit;
+        'message' => 'Unable to fetch admin summary',
+        'error'   => $exception->getMessage(),
+    ], 500);
 }
