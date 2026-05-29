@@ -3,179 +3,175 @@ declare(strict_types=1);
 
 require_once __DIR__ . '/../bootstrap/api.php';
 require_once __DIR__ . '/../middleware/auth.php';
-require_once __DIR__ . '/../jobs/helpers.php';
+
+// FSM UPGRADE START
+function location_history_has_valid_coordinates(?float $latitude, ?float $longitude): bool
+{
+    if ($latitude === null || $longitude === null) {
+        return false;
+    }
+
+    if (!is_finite($latitude) || !is_finite($longitude)) {
+        return false;
+    }
+
+    if (
+        $latitude < -90 ||
+        $latitude > 90 ||
+        $longitude < -180 ||
+        $longitude > 180
+    ) {
+        return false;
+    }
+
+    return !($latitude == 0.0 && $longitude == 0.0);
+}
+
+function location_history_nullable_metric($value, bool $allowNegative = false, ?float $maxValue = null): ?float
+{
+    if (!is_numeric($value)) {
+        return null;
+    }
+
+    $normalized = (float)$value;
+
+    if (!is_finite($normalized)) {
+        return null;
+    }
+
+    if (!$allowNegative && $normalized < 0) {
+        return null;
+    }
+
+    if ($maxValue !== null && $normalized > $maxValue) {
+        return null;
+    }
+
+    return $normalized;
+}
+
+function location_history_heading($value): ?float
+{
+    $heading = location_history_nullable_metric($value, true);
+
+    if ($heading === null) {
+        return null;
+    }
+
+    $heading = fmod($heading, 360.0);
+
+    if ($heading < 0) {
+        $heading += 360.0;
+    }
+
+    return round($heading, 2);
+}
+
+function location_history_iso8601(?string $value): ?string
+{
+    if ($value === null || trim($value) === '') {
+        return null;
+    }
+
+    $timestamp = strtotime($value);
+
+    if ($timestamp === false) {
+        return null;
+    }
+
+    return gmdate('c', $timestamp);
+}
+// FSM UPGRADE END
 
 enforce_method('GET');
 
 $user = authenticate($pdo);
-ensureDeletedJobsTable($pdo);
+$jobId = query_int_value('job_id');
 
-// ─────────────────────────────────────────────
-// INPUTS
-// ─────────────────────────────────────────────
-$requestedTechnicianId = query_int_value('technician_id');
-$requestedJobId = query_int_value('job_id');
-
-$limit = isset($_GET['limit']) ? (int)$_GET['limit'] : 200;
-$limit = max(20, min($limit, 1000));
-
-$onlyActiveSession = isset($_GET['active_only']) ? (bool)$_GET['active_only'] : false;
-
-// ─────────────────────────────────────────────
-// QUERY BUILD
-// ─────────────────────────────────────────────
 $params = [];
-$where = ['dj.job_id IS NULL'];
+$where = [];
 
-// ROLE FILTER
-if (in_array($user['role'], ['admin', 'manager'], true)) {
-    if ($requestedTechnicianId !== null && $requestedTechnicianId > 0) {
-        $where[] = 'l.user_id = ?';
-        $params[] = $requestedTechnicianId;
-    }
-} else {
-    $where[] = 'l.user_id = ?';
+// Optional job filter
+if ($jobId !== null && $jobId > 0) {
+    $where[] = 'l.job_id = ?';
+    $params[] = $jobId;
+}
+
+// Restrict technicians to their own history
+if (!in_array($user['role'], ['admin', 'manager'], true)) {
+    $where[] = 'l.technician_id = ?';
     $params[] = (int)$user['id'];
 }
 
-// JOB FILTER
-if ($requestedJobId !== null && $requestedJobId > 0) {
-    $where[] = 'l.job_id = ?';
-    $params[] = $requestedJobId;
-}
-
-// ACTIVE SESSION FILTER
-if ($onlyActiveSession) {
-    $where[] = "s.status = 'active'";
-}
-
-// 🔥 STRICT QUALITY FILTER
-$where[] = "(l.accuracy IS NULL OR l.accuracy <= 25)";
-
-$whereSql = implode(' AND ', $where);
-
-// ─────────────────────────────────────────────
-// EXECUTION
-// ─────────────────────────────────────────────
 try {
-    $sql = "
-        SELECT
-            l.id,
-            l.job_id,
-            l.user_id AS technician_id,
-            l.latitude,
-            l.longitude,
-            l.accuracy,
-            l.speed,
-            l.battery,
-            l.is_charging,
-            l.created_at AS captured_at,
-            l.session_id,
-            j.status AS status,
-            COALESCE(s.status, 'stopped') AS tracking_status
-        FROM job_locations l
-        INNER JOIN jobs j ON j.id = l.job_id
-        LEFT JOIN deleted_jobs dj ON dj.job_id = j.id
-        LEFT JOIN job_tracking_sessions s ON s.id = l.session_id
-        WHERE {$whereSql}
-        ORDER BY l.session_id ASC, l.created_at ASC
-        LIMIT {$limit}
-    ";
+$sql = "
+    SELECT
+        l.technician_id,
+        l.job_id,
+        l.session_id,
+        l.latitude,
+        l.longitude,
+        l.accuracy,
+        l.speed,
+        l.heading,
+        l.battery,
+        l.is_charging,
+        COALESCE(l.device_time, l.created_at) AS captured_at,
+        l.created_at AS received_at,
+        l.device_time
+    FROM technician_locations l
+    " . (!empty($where)
+        ? 'WHERE ' . implode(' AND ', $where)
+        : '') . "
+    ORDER BY COALESCE(l.device_time, l.created_at) ASC, l.id ASC
+    LIMIT 5000
+";
 
     $stmt = $pdo->prepare($sql);
     $stmt->execute($params);
     $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    // ─────────────────────────────────────────────
-    // PATH CLEANING (PER TECHNICIAN + JOB)
-    // ─────────────────────────────────────────────
-    $clean = [];
-    $prevPoints = [];
+    $final = [];
 
     foreach ($rows as $row) {
-
         $lat = isset($row['latitude']) ? (float)$row['latitude'] : null;
         $lng = isset($row['longitude']) ? (float)$row['longitude'] : null;
 
-        // ❌ INVALID GPS
-        if (
-            $lat === null || $lng === null ||
-            $lat < -90 || $lat > 90 ||
-            $lng < -180 || $lng > 180 ||
-            ($lat == 0.0 && $lng == 0.0)
-        ) {
+        if (!location_history_has_valid_coordinates($lat, $lng)) {
             continue;
         }
 
-        $key = $row['technician_id'] . '_' . $row['job_id'];
-
-        $prev = $prevPoints[$key] ?? null;
-
-        if ($prev) {
-            $dist = haversine($prev['lat'], $prev['lng'], $lat, $lng);
-
-            // ❌ JITTER
-            if ($dist < 8) {
-                continue;
-            }
-
-            // ❌ TELEPORT
-            if ($dist > 300) {
-                continue;
-            }
-        }
-
-        // SAVE PREVIOUS
-        $prevPoints[$key] = ['lat' => $lat, 'lng' => $lng];
-
-        // NORMALIZE
         $row['latitude'] = $lat;
         $row['longitude'] = $lng;
-        $row['accuracy'] = isset($row['accuracy']) ? (float)$row['accuracy'] : null;
-        $row['speed'] = isset($row['speed']) ? (float)$row['speed'] : null;
-
+        $row['accuracy'] = location_history_nullable_metric($row['accuracy'] ?? null, false, 60);
+        $row['speed'] = location_history_nullable_metric($row['speed'] ?? null, false, 60);
+        $row['heading'] = location_history_heading($row['heading'] ?? null);
         $row['battery'] = is_numeric($row['battery'] ?? null)
             ? max(0, min(100, (int)$row['battery']))
             : null;
-
         $row['is_charging'] = (bool)($row['is_charging'] ?? false);
+        $row['captured_at'] = location_history_iso8601(
+            isset($row['captured_at']) ? (string)$row['captured_at'] : null
+        );
+        $row['received_at'] = location_history_iso8601(
+            isset($row['received_at']) ? (string)$row['received_at'] : null
+        );
+        $row['device_time'] = !empty($row['device_time'])
+            ? location_history_iso8601((string)$row['device_time'])
+            : null;
 
-        $row['tracking_status'] = $row['tracking_status'] ?? 'stopped';
-        $row['status'] = $row['status'] ?? '';
-
-        // ISO UTC FORMAT
-        $row['captured_at'] = gmdate('c', strtotime($row['captured_at']));
-
-        $clean[] = $row;
+        $final[] = $row;
     }
 
     respond_with_json([
         'success' => true,
-        'count' => count($clean),
-        'history' => $clean,
+        'data' => $final
     ]);
-
 } catch (Throwable $exception) {
+    error_log($exception->getMessage());
+
     respond_with_json([
         'success' => false,
-        'message' => 'Unable to fetch location history',
-        'error' => $exception->getMessage(),
+        'message' => 'Unable to fetch location history'
     ], 500);
-}
-
-// ─────────────────────────────────────────────
-// HELPER
-// ─────────────────────────────────────────────
-function haversine($lat1, $lon1, $lat2, $lon2): float {
-    $R = 6371000;
-
-    $dLat = deg2rad($lat2 - $lat1);
-    $dLon = deg2rad($lon2 - $lon1);
-
-    $a = sin($dLat/2)**2 +
-         cos(deg2rad($lat1)) *
-         cos(deg2rad($lat2)) *
-         sin($dLon/2)**2;
-
-    return 2 * $R * atan2(sqrt($a), sqrt(1 - $a));
 }

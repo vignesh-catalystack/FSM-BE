@@ -1,0 +1,1078 @@
+<?php
+declare(strict_types=1);
+
+require_once __DIR__ . '/../bootstrap/api.php';
+require_once __DIR__ . '/../middleware/auth.php';
+
+function tracking_is_list_array(array $value): bool
+{
+    if ($value === []) {
+        return true;
+    }
+
+    return array_keys($value) === range(0, count($value) - 1);
+}
+
+function tracking_looks_like_point(array $payload): bool
+{
+    foreach ([
+        'job_id',
+        'id',
+        'session_id',
+        'latitude',
+        'lat',
+        'longitude',
+        'lng',
+        'long',
+        'lon',
+    ] as $key) {
+        if (array_key_exists($key, $payload)) {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+function tracking_extract_points(array $jsonPayload, array $formPayload): array
+{
+    foreach ([$jsonPayload, $formPayload] as $payload) {
+        if ($payload === []) {
+            continue;
+        }
+
+        if (tracking_is_list_array($payload)) {
+            return $payload;
+        }
+
+        foreach ([
+            'points',
+            'locations',
+            'records',
+            'items',
+            'data',
+            'track_points',
+        ] as $key) {
+            if (!isset($payload[$key]) || !is_array($payload[$key])) {
+                continue;
+            }
+
+            if (tracking_is_list_array($payload[$key])) {
+                return $payload[$key];
+            }
+
+            if (tracking_looks_like_point($payload[$key])) {
+                return [$payload[$key]];
+            }
+        }
+
+        if (tracking_looks_like_point($payload)) {
+            return [$payload];
+        }
+    }
+
+    return [];
+}
+
+function tracking_root_defaults(array $jsonPayload, array $formPayload): array
+{
+    $defaults = [];
+
+    foreach ([$formPayload, $jsonPayload] as $payload) {
+        if ($payload === [] || tracking_is_list_array($payload)) {
+            continue;
+        }
+
+        $defaults = array_replace($defaults, $payload);
+    }
+
+    return $defaults;
+}
+
+function tracking_payload_value(array $payload, array $keys)
+{
+    foreach ($keys as $key) {
+        if (array_key_exists($key, $payload)) {
+            return $payload[$key];
+        }
+    }
+
+    return null;
+}
+
+function tracking_parse_int(array $payload, array $keys, int $default = 0): int
+{
+    $raw = tracking_payload_value($payload, $keys);
+
+    if ($raw === null || $raw === '') {
+        return $default;
+    }
+
+    return (int)$raw;
+}
+
+function tracking_parse_float(array $payload, array $keys): ?float
+{
+    $raw = tracking_payload_value($payload, $keys);
+
+    if ($raw === null || $raw === '') {
+        return null;
+    }
+
+    if (!is_numeric($raw)) {
+        return null;
+    }
+
+    return (float)$raw;
+}
+
+function tracking_parse_bool_int(array $payload, array $keys): ?int
+{
+    $raw = tracking_payload_value($payload, $keys);
+
+    if ($raw === null || $raw === '') {
+        return null;
+    }
+
+    if (is_bool($raw)) {
+        return $raw ? 1 : 0;
+    }
+
+    if (is_numeric($raw)) {
+        return ((float)$raw) > 0 ? 1 : 0;
+    }
+
+    $normalized = strtolower(trim((string)$raw));
+
+    if (in_array($normalized, ['1', 'true', 'yes', 'on', 'charging'], true)) {
+        return 1;
+    }
+
+    if (in_array($normalized, ['0', 'false', 'no', 'off', 'not_charging'], true)) {
+        return 0;
+    }
+
+    return null;
+}
+
+function tracking_parse_battery(array $payload, array $keys): ?int
+{
+    $raw = tracking_payload_value($payload, $keys);
+
+    if ($raw === null || $raw === '') {
+        return null;
+    }
+
+    if (!is_numeric($raw)) {
+        return null;
+    }
+
+    $battery = (float)$raw;
+
+    if ($battery > 0 && $battery <= 1) {
+        $battery *= 100;
+    }
+
+    return max(0, min(100, (int)round($battery)));
+}
+
+function tracking_parse_datetime_value($raw): ?string
+{
+    if ($raw === null || $raw === '') {
+        return null;
+    }
+
+    try {
+        if (is_int($raw) || is_float($raw) || (is_string($raw) && is_numeric($raw))) {
+            $timestamp = (float)$raw;
+
+            if ($timestamp <= 0) {
+                return null;
+            }
+
+            if ($timestamp < 1577836800) {
+                return null;
+            }
+
+            if ($timestamp > 9999999999) {
+                $timestamp /= 1000;
+            }
+
+            return (new DateTimeImmutable('@' . (string)round($timestamp)))
+                ->setTimezone(new DateTimeZone('UTC'))
+                ->format('Y-m-d H:i:s');
+        }
+
+        return (new DateTimeImmutable(trim((string)$raw)))
+            ->setTimezone(new DateTimeZone('UTC'))
+            ->format('Y-m-d H:i:s');
+    } catch (Throwable $exception) {
+        return null;
+    }
+}
+
+function tracking_parse_datetime(array $payload, array $keys): ?string
+{
+    return tracking_parse_datetime_value(
+        tracking_payload_value($payload, $keys)
+    );
+}
+
+function tracking_normalize_accuracy(?float $accuracy): ?float
+{
+    if (
+        $accuracy === null ||
+        !is_finite($accuracy) ||
+        $accuracy < 0 ||
+        $accuracy > 500
+    ) {
+        return null;
+    }
+
+    return round($accuracy, 2);
+}
+
+function tracking_normalize_speed(?float $speed): ?float
+{
+    if (
+        $speed === null ||
+        !is_finite($speed) ||
+        $speed < 0 ||
+        $speed > 120
+    ) {
+        return null;
+    }
+
+    return round($speed, 3);
+}
+
+function tracking_normalize_heading(?float $heading): ?float
+{
+    if ($heading === null || !is_finite($heading)) {
+        return null;
+    }
+
+    $heading = fmod($heading, 360.0);
+
+    if ($heading < 0) {
+        $heading += 360.0;
+    }
+
+    return $heading;
+}
+
+// FSM UPGRADE START
+function tracking_has_valid_coordinates(?float $latitude, ?float $longitude): bool
+{
+    if ($latitude === null || $longitude === null) {
+        return false;
+    }
+
+    if (!is_finite($latitude) || !is_finite($longitude)) {
+        return false;
+    }
+
+    if (
+        $latitude < -90 ||
+        $latitude > 90 ||
+        $longitude < -180 ||
+        $longitude > 180
+    ) {
+        return false;
+    }
+
+    return !($latitude == 0.0 && $longitude == 0.0);
+}
+
+function tracking_datetime_to_timestamp(?string $value): ?int
+{
+    if ($value === null || trim($value) === '') {
+        return null;
+    }
+
+    $timestamp = strtotime($value);
+
+    if ($timestamp === false) {
+        return null;
+    }
+
+    return (int)$timestamp;
+}
+
+function tracking_normalize_captured_at(string $capturedAt, string $nowUtc): string
+{
+    $capturedTimestamp = tracking_datetime_to_timestamp($capturedAt);
+    $nowTimestamp = tracking_datetime_to_timestamp($nowUtc);
+
+    if ($capturedTimestamp === null || $nowTimestamp === null) {
+        return $nowUtc;
+    }
+
+    if ($capturedTimestamp > ($nowTimestamp + 60)) {
+        return $nowUtc;
+    }
+
+    return $capturedAt;
+}
+
+function tracking_distance_meters(
+    float $latitudeFrom,
+    float $longitudeFrom,
+    float $latitudeTo,
+    float $longitudeTo
+): float {
+    $earthRadius = 6371000.0;
+    $latitudeDelta = deg2rad($latitudeTo - $latitudeFrom);
+    $longitudeDelta = deg2rad($longitudeTo - $longitudeFrom);
+    $latitudeFrom = deg2rad($latitudeFrom);
+    $latitudeTo = deg2rad($latitudeTo);
+
+    $a = sin($latitudeDelta / 2) ** 2
+        + cos($latitudeFrom) * cos($latitudeTo) * sin($longitudeDelta / 2) ** 2;
+
+    $c = 2 * atan2(sqrt($a), sqrt(1 - $a));
+
+    return $earthRadius * $c;
+}
+
+function tracking_accuracy_allowance(?float $accuracy): float
+{
+    if ($accuracy === null) {
+        return 25.0;
+    }
+
+    return max(5.0, min(1000.0, $accuracy));
+}
+
+function tracking_is_spike_point(?array $previousPoint, array $currentPoint): bool
+{
+    if ($previousPoint === null) {
+        return false;
+    }
+
+    $previousLatitude = isset($previousPoint['latitude'])
+        ? (float)$previousPoint['latitude']
+        : null;
+    $previousLongitude = isset($previousPoint['longitude'])
+        ? (float)$previousPoint['longitude']
+        : null;
+
+    if (
+        !tracking_has_valid_coordinates($previousLatitude, $previousLongitude) ||
+        !tracking_has_valid_coordinates(
+            $currentPoint['latitude'] ?? null,
+            $currentPoint['longitude'] ?? null
+        )
+    ) {
+        return false;
+    }
+
+    $previousCapturedAt = tracking_datetime_to_timestamp(
+        (string)($previousPoint['captured_at'] ?? '')
+    );
+    $currentCapturedAt = tracking_datetime_to_timestamp(
+        (string)($currentPoint['captured_at'] ?? '')
+    );
+
+    if ($previousCapturedAt === null || $currentCapturedAt === null) {
+        return false;
+    }
+
+    $distanceMeters = tracking_distance_meters(
+        $previousLatitude,
+        $previousLongitude,
+        (float)$currentPoint['latitude'],
+        (float)$currentPoint['longitude']
+    );
+    $deltaSeconds = $currentCapturedAt - $previousCapturedAt;
+    $accuracyAllowance = max(
+        tracking_accuracy_allowance(
+            isset($previousPoint['accuracy_raw']) && is_numeric($previousPoint['accuracy_raw'])
+                ? (float)$previousPoint['accuracy_raw']
+                : null
+        ),
+        tracking_accuracy_allowance(
+            isset($currentPoint['accuracy_raw']) && is_numeric($currentPoint['accuracy_raw'])
+                ? (float)$currentPoint['accuracy_raw']
+                : null
+        )
+    );
+
+    if ($deltaSeconds < 0) {
+        return true;
+    }
+
+    if ($deltaSeconds === 0) {
+        return $distanceMeters > max(200.0, $accuracyAllowance * 4.0);
+    }
+
+    $reportedSpeed = max(
+        isset($previousPoint['speed_raw']) && is_numeric($previousPoint['speed_raw'])
+            ? (float)$previousPoint['speed_raw']
+            : 0.0,
+        isset($currentPoint['speed_raw']) && is_numeric($currentPoint['speed_raw'])
+            ? (float)$currentPoint['speed_raw']
+            : 0.0
+    );
+    $observedSpeed = $distanceMeters / max(1, $deltaSeconds);
+    $maxSpeed = max(55.0, min(120.0, $reportedSpeed * 2.5));
+    $maxDistance = max(
+        250.0,
+        ($maxSpeed * $deltaSeconds) + ($accuracyAllowance * 4.0)
+    );
+
+    if ($distanceMeters > $maxDistance && $deltaSeconds <= 2) {
+        return true;
+    }
+
+    return $distanceMeters > $maxDistance && $observedSpeed > $maxSpeed;
+}
+
+function tracking_should_replace_live_point(
+    ?array $currentPoint,
+    ?string $currentCapturedAt,
+    array $candidatePoint
+): bool {
+    if ($currentCapturedAt === null) {
+        return true;
+    }
+
+    if ($candidatePoint['captured_at'] > $currentCapturedAt) {
+        return true;
+    }
+
+    if ($candidatePoint['captured_at'] < $currentCapturedAt) {
+        return false;
+    }
+
+    if ($currentPoint === null) {
+        return true;
+    }
+
+    $currentAccuracy = isset($currentPoint['accuracy']) && is_numeric($currentPoint['accuracy'])
+        ? (float)$currentPoint['accuracy']
+        : null;
+    $candidateAccuracy = isset($candidatePoint['accuracy']) && is_numeric($candidatePoint['accuracy'])
+        ? (float)$candidatePoint['accuracy']
+        : null;
+
+    if ($currentAccuracy === null && $candidateAccuracy !== null) {
+        return true;
+    }
+
+    if ($currentAccuracy !== null && $candidateAccuracy === null) {
+        return false;
+    }
+
+    if ($currentAccuracy !== null && $candidateAccuracy !== null) {
+        return $candidateAccuracy <= $currentAccuracy;
+    }
+
+    return false;
+}
+// FSM UPGRADE END
+
+function tracking_point_signature(array $point): string
+{
+    return implode('|', [
+        number_format($point['latitude'], 7, '.', ''),
+        number_format($point['longitude'], 7, '.', ''),
+        $point['captured_at'],
+    ]);
+}
+
+function tracking_normalize_points(array $jsonPayload, array $formPayload): array
+{
+    $rawPoints = tracking_extract_points($jsonPayload, $formPayload);
+    $defaults = tracking_root_defaults($jsonPayload, $formPayload);
+    $normalized = [];
+    $nowUtc = gmdate('Y-m-d H:i:s');
+
+    foreach ($rawPoints as $index => $rawPoint) {
+        if ($index % 10 === 0) {
+            $nowUtc = gmdate('Y-m-d H:i:s');
+        }
+
+        if (!is_array($rawPoint)) {
+            continue;
+        }
+
+        $payload = array_replace($defaults, $rawPoint);
+
+        $latitude = tracking_parse_float($payload, ['latitude', 'lat']);
+        $longitude = tracking_parse_float($payload, ['longitude', 'lng', 'long', 'lon']);
+        $rawSpeed = tracking_parse_float($payload, ['speed']);
+        $rawAccuracy = tracking_parse_float($payload, ['accuracy', 'gps_accuracy']);
+
+        $normalized[] = [
+            'index' => (int)$index,
+            'job_id' => tracking_parse_int($payload, ['job_id', 'id']),
+            'session_id' => tracking_parse_int($payload, ['session_id']),
+            'latitude' => $latitude,
+            'longitude' => $longitude,
+            'speed_raw' => $rawSpeed,
+            'accuracy_raw' => $rawAccuracy,
+            'accuracy' => tracking_normalize_accuracy(
+                $rawAccuracy
+            ),
+            'speed' => tracking_normalize_speed(
+                $rawSpeed
+            ),
+            'heading' => tracking_normalize_heading(
+                tracking_parse_float($payload, ['heading', 'bearing'])
+            ),
+            'battery' => tracking_parse_battery($payload, ['battery', 'battery_level']),
+            'is_charging' => tracking_parse_bool_int($payload, ['is_charging', 'charging', 'plugged']) ?? 0,
+            'captured_at' => tracking_normalize_captured_at(
+                tracking_parse_datetime(
+                    $payload,
+                    ['device_time', 'captured_at', 'tracked_at', 'recorded_at', 'timestamp', 'location_time']
+                ) ?? $nowUtc,
+                $nowUtc
+            ),
+        ];
+    }
+
+    usort($normalized, static function (array $left, array $right): int {
+        $compare = strcmp($left['captured_at'], $right['captured_at']);
+
+        if ($compare !== 0) {
+            return $compare;
+        }
+
+        return $left['index'] <=> $right['index'];
+    });
+
+    return $normalized;
+}
+
+enforce_method('POST');
+
+$user = authenticate($pdo);
+
+if (($user['role'] ?? '') !== 'technician') {
+    respond_with_json([
+        'success' => false,
+        'message' => 'Only technicians can track location'
+    ], 403);
+}
+
+$jsonPayload = read_json_input();
+$formPayload = is_array($_POST) ? $_POST : [];
+$points = tracking_normalize_points($jsonPayload, $formPayload);
+
+if ($points === []) {
+    respond_with_json([
+        'success' => false,
+        'message' => 'Invalid tracking payload'
+    ], 400);
+}
+
+$jobIds = [];
+$requestedSessionIds = [];
+
+foreach ($points as $point) {
+    if (($point['job_id'] ?? 0) > 0) {
+        $jobIds[(int)$point['job_id']] = true;
+    }
+
+    if (($point['session_id'] ?? 0) > 0) {
+        $requestedSessionIds[(int)$point['session_id']] = true;
+    }
+}
+
+if (count($jobIds) === 0) {
+    respond_with_json([
+        'success' => false,
+        'message' => 'Tracking payload contains no valid job_id'
+    ], 400);
+}
+
+if (count($jobIds) > 1) {
+    respond_with_json([
+        'success' => false,
+        'message' => 'Tracking payload must target exactly one job'
+    ], 400);
+}
+
+if (count($requestedSessionIds) > 1) {
+    respond_with_json([
+        'success' => false,
+        'message' => 'Tracking payload must target one session'
+    ], 400);
+}
+
+$jobId = (int)array_key_first($jobIds);
+$requestedSessionId = count($requestedSessionIds) === 1
+    ? (int)array_key_first($requestedSessionIds)
+    : 0;
+$technicianId = (int)$user['id'];
+
+try {
+    $pdo->beginTransaction();
+
+    $jobStmt = $pdo->prepare("
+        SELECT
+            id,
+            assigned_to,
+            status
+        FROM jobs
+        WHERE id = ?
+        LIMIT 1
+        FOR UPDATE
+    ");
+
+    $jobStmt->execute([$jobId]);
+    $job = $jobStmt->fetch(PDO::FETCH_ASSOC);
+
+    if (!$job) {
+        $pdo->rollBack();
+
+        respond_with_json([
+            'success' => false,
+            'message' => 'Job not found'
+        ], 404);
+    }
+
+    if ((int)$job['assigned_to'] !== $technicianId) {
+        $pdo->rollBack();
+
+        respond_with_json([
+            'success' => false,
+            'message' => 'Job is not assigned to this technician'
+        ], 403);
+    }
+
+    $jobStatus = strtolower(trim((string)($job['status'] ?? '')));
+
+    if (in_array($jobStatus, ['cancelled', 'deleted'], true)) {
+        $pdo->rollBack();
+
+        respond_with_json([
+            'success' => false,
+            'message' => 'Tracking is not allowed for this job status',
+            'status' => $jobStatus
+        ], 409);
+    }
+
+    $historyOnlyMode = $jobStatus === 'completed';
+
+    $cleanupStmt = $pdo->prepare("
+        UPDATE job_tracking_sessions
+        SET
+            status = 'stopped',
+            ended_at = COALESCE(ended_at, UTC_TIMESTAMP())
+        WHERE technician_id = ?
+          AND status = 'active'
+          AND ended_at IS NULL
+          AND start_time < (UTC_TIMESTAMP() - INTERVAL 1 DAY)
+    ");
+
+    $cleanupStmt->execute([$technicianId]);
+
+    $session = null;
+
+    if ($requestedSessionId > 0) {
+        $sessionStmt = $pdo->prepare("
+            SELECT
+                id,
+                status,
+                start_time,
+                ended_at
+            FROM job_tracking_sessions
+            WHERE id = ?
+              AND job_id = ?
+              AND technician_id = ?
+            LIMIT 1
+            FOR UPDATE
+        ");
+
+        $sessionStmt->execute([
+            $requestedSessionId,
+            $jobId,
+            $technicianId
+        ]);
+
+        $session = $sessionStmt->fetch(PDO::FETCH_ASSOC) ?: null;
+    }
+
+    if ($session === null || (!$historyOnlyMode && ($session['status'] ?? '') !== 'active')) {
+        if ($historyOnlyMode) {
+            $sessionStmt = $pdo->prepare("
+                SELECT
+                    id,
+                    status,
+                    start_time,
+                    ended_at
+                FROM job_tracking_sessions
+                WHERE job_id = ?
+                  AND technician_id = ?
+                ORDER BY
+                    CASE WHEN status = 'active' THEN 0 ELSE 1 END,
+                    start_time DESC,
+                    id DESC
+                LIMIT 1
+                FOR UPDATE
+            ");
+
+            $sessionStmt->execute([
+                $jobId,
+                $technicianId
+            ]);
+
+            $session = $sessionStmt->fetch(PDO::FETCH_ASSOC) ?: null;
+        } else {
+            $sessionStmt = $pdo->prepare("
+                SELECT
+                    id,
+                    status,
+                    start_time,
+                    ended_at
+                FROM job_tracking_sessions
+                WHERE job_id = ?
+                  AND technician_id = ?
+                  AND status = 'active'
+                ORDER BY start_time DESC, id DESC
+                LIMIT 1
+                FOR UPDATE
+            ");
+
+            $sessionStmt->execute([
+                $jobId,
+                $technicianId
+            ]);
+
+            $session = $sessionStmt->fetch(PDO::FETCH_ASSOC) ?: null;
+        }
+    }
+
+    if ($session === null && !$historyOnlyMode) {
+        $sessionStmt = $pdo->prepare("
+            INSERT INTO job_tracking_sessions (
+                job_id,
+                technician_id,
+                status,
+                start_time
+            ) VALUES (
+                ?, ?, 'active', UTC_TIMESTAMP()
+            )
+        ");
+
+        $sessionStmt->execute([
+            $jobId,
+            $technicianId
+        ]);
+
+        $session = [
+            'id' => (int)$pdo->lastInsertId(),
+            'status' => 'active',
+            'start_time' => gmdate('Y-m-d H:i:s'),
+            'ended_at' => null,
+        ];
+    }
+
+    if ($session === null) {
+        $pdo->rollBack();
+
+        respond_with_json([
+            'success' => false,
+            'message' => 'No tracking session found for this job'
+        ], 409);
+    }
+
+    if (!$historyOnlyMode && ($session['status'] ?? '') !== 'active') {
+        $pdo->rollBack();
+
+        respond_with_json([
+            'success' => false,
+            'message' => 'Invalid tracking session'
+        ], 400);
+    }
+
+    $sessionId = (int)$session['id'];
+    $sessionIsActive = ($session['status'] ?? '') === 'active';
+
+    $historyStateStmt = $pdo->prepare("
+        SELECT
+            latitude,
+            longitude,
+            accuracy,
+            speed,
+            COALESCE(device_time, created_at) AS captured_at
+        FROM technician_locations
+        WHERE technician_id = ?
+          AND job_id = ?
+          AND session_id = ?
+        ORDER BY id DESC
+        LIMIT 1
+    ");
+
+    $historyStateStmt->execute([
+        $technicianId,
+        $jobId,
+        $sessionId
+    ]);
+
+    $lastHistoryRow = $historyStateStmt->fetch(PDO::FETCH_ASSOC) ?: null;
+    // FSM UPGRADE START
+    $lastAcceptedPoint = null;
+    $lastHistoryCoordinatesAreValid = $lastHistoryRow !== null && tracking_has_valid_coordinates(
+        isset($lastHistoryRow['latitude']) ? (float)$lastHistoryRow['latitude'] : null,
+        isset($lastHistoryRow['longitude']) ? (float)$lastHistoryRow['longitude'] : null
+    );
+    // FSM UPGRADE END
+    $lastHistorySignature = $lastHistoryCoordinatesAreValid
+        ? tracking_point_signature([
+            'latitude' => (float)$lastHistoryRow['latitude'],
+            'longitude' => (float)$lastHistoryRow['longitude'],
+            'captured_at' => (string)$lastHistoryRow['captured_at'],
+        ])
+        : null;
+    // FSM UPGRADE START
+    if ($lastHistoryCoordinatesAreValid) {
+        $lastAcceptedPoint = [
+            'latitude' => (float)$lastHistoryRow['latitude'],
+            'longitude' => (float)$lastHistoryRow['longitude'],
+            'accuracy_raw' => isset($lastHistoryRow['accuracy']) && is_numeric($lastHistoryRow['accuracy'])
+                ? (float)$lastHistoryRow['accuracy']
+                : null,
+            'speed_raw' => isset($lastHistoryRow['speed']) && is_numeric($lastHistoryRow['speed'])
+                ? (float)$lastHistoryRow['speed']
+                : null,
+            'captured_at' => (string)$lastHistoryRow['captured_at'],
+        ];
+    }
+    // FSM UPGRADE END
+
+    $liveStateStmt = $pdo->prepare("
+        SELECT updated_at
+        FROM technician_last_locations
+        WHERE technician_id = ?
+        LIMIT 1
+        FOR UPDATE
+    ");
+
+    $liveStateStmt->execute([$technicianId]);
+    $currentLiveRow = $liveStateStmt->fetch(PDO::FETCH_ASSOC) ?: null;
+    $currentLiveCapturedAt = $currentLiveRow['updated_at'] ?? null;
+
+    $insertHistoryStmt = $pdo->prepare("
+        INSERT INTO technician_locations (
+            session_id,
+            job_id,
+            technician_id,
+            latitude,
+            longitude,
+            accuracy,
+            speed,
+            heading,
+            battery,
+            is_charging,
+            created_at,
+            device_time
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), ?
+        )
+    ");
+
+    // FSM UPGRADE START
+    $liveUpdateIsNewerSql = "
+        VALUES(updated_at) >= COALESCE(updated_at, '1970-01-01 00:00:00')
+    ";
+    // FSM UPGRADE END
+    $upsertLiveStmt = $pdo->prepare("
+        INSERT INTO technician_last_locations (
+            technician_id,
+            job_id,
+            session_id,
+            latitude,
+            longitude,
+            accuracy,
+            speed,
+            heading,
+            battery,
+            is_charging,
+            updated_at
+        ) VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        )
+        ON DUPLICATE KEY UPDATE
+            job_id = IF({$liveUpdateIsNewerSql}, VALUES(job_id), job_id),
+            session_id = IF({$liveUpdateIsNewerSql}, VALUES(session_id), session_id),
+            latitude = IF({$liveUpdateIsNewerSql}, VALUES(latitude), latitude),
+            longitude = IF({$liveUpdateIsNewerSql}, VALUES(longitude), longitude),
+            accuracy = IF({$liveUpdateIsNewerSql}, VALUES(accuracy), accuracy),
+            speed = IF({$liveUpdateIsNewerSql}, VALUES(speed), speed),
+            heading = IF({$liveUpdateIsNewerSql}, VALUES(heading), heading),
+            battery = IF({$liveUpdateIsNewerSql}, VALUES(battery), battery),
+            is_charging = IF({$liveUpdateIsNewerSql}, VALUES(is_charging), is_charging),
+            updated_at = GREATEST(
+                COALESCE(updated_at, '1970-01-01 00:00:00'),
+                VALUES(updated_at)
+            )
+    ");
+
+    $userBatteryStmt = $pdo->prepare("
+        UPDATE users
+        SET
+            battery = ?,
+            is_charging = ?
+        WHERE id = ?
+    ");
+
+    $receivedPoints = count($points);
+    $savedPoints = 0;
+    $duplicatePoints = 0;
+    $invalidPoints = 0;
+    $liveUpdated = false;
+    $latestLivePoint = null;
+    $latestLiveCapturedAt = $currentLiveCapturedAt;
+    $batchSeenSignatures = [];
+
+    foreach ($points as $point) {
+        $latitude = $point['latitude'];
+        $longitude = $point['longitude'];
+
+        if (!tracking_has_valid_coordinates($latitude, $longitude)) {
+            $invalidPoints++;
+            continue;
+        }
+
+        // FSM UPGRADE START
+        if (tracking_is_spike_point($lastAcceptedPoint, $point)) {
+            $invalidPoints++;
+            continue;
+        }
+        // FSM UPGRADE END
+
+        $pointMovedLessThanThreshold = false;
+
+        if (
+            $lastAcceptedPoint !== null &&
+            tracking_has_valid_coordinates(
+                isset($lastAcceptedPoint['latitude']) ? (float)$lastAcceptedPoint['latitude'] : null,
+                isset($lastAcceptedPoint['longitude']) ? (float)$lastAcceptedPoint['longitude'] : null
+            )
+        ) {
+            $distanceFromLastAccepted = tracking_distance_meters(
+                (float)$lastAcceptedPoint['latitude'],
+                (float)$lastAcceptedPoint['longitude'],
+                (float)$latitude,
+                (float)$longitude
+            );
+
+            $pointMovedLessThanThreshold = $distanceFromLastAccepted < 3.0;
+        }
+
+        $signature = tracking_point_signature($point);
+
+        $isDuplicate = ($signature === $lastHistorySignature)
+            || isset($batchSeenSignatures[$signature])
+            || $pointMovedLessThanThreshold;
+
+        if ($isDuplicate) {
+            $duplicatePoints++;
+        } else {
+            $insertHistoryStmt->execute([
+                $sessionId,
+                $jobId,
+                $technicianId,
+                $latitude,
+                $longitude,
+                $point['accuracy'],
+                $point['speed'],
+                $point['heading'],
+                $point['battery'],
+                $point['is_charging'],
+                $point['captured_at'],
+            ]);
+
+            $savedPoints++;
+            $lastHistorySignature = $signature;
+            $batchSeenSignatures[$signature] = true;
+
+            // FSM UPGRADE START
+            $lastAcceptedPoint = [
+                'latitude' => $latitude,
+                'longitude' => $longitude,
+                'accuracy_raw' => $point['accuracy_raw'],
+                'speed_raw' => $point['speed_raw'],
+                'captured_at' => $point['captured_at'],
+            ];
+            // FSM UPGRADE END
+        }
+
+        $livePoint = $point;
+
+        if ($pointMovedLessThanThreshold && $lastAcceptedPoint !== null) {
+            $livePoint['latitude'] = (float)$lastAcceptedPoint['latitude'];
+            $livePoint['longitude'] = (float)$lastAcceptedPoint['longitude'];
+        }
+
+        if (
+            $sessionIsActive &&
+            !$historyOnlyMode &&
+            tracking_should_replace_live_point(
+                $latestLivePoint,
+                $latestLiveCapturedAt,
+                $livePoint
+            )
+        ) {
+            $latestLivePoint = $livePoint;
+            $latestLiveCapturedAt = $livePoint['captured_at'];
+        }
+    }
+
+    if ($latestLivePoint !== null) {
+        $upsertLiveStmt->execute([
+            $technicianId,
+            $jobId,
+            $sessionId,
+            $latestLivePoint['latitude'],
+            $latestLivePoint['longitude'],
+            $latestLivePoint['accuracy'],
+            $latestLivePoint['speed'],
+            $latestLivePoint['heading'],
+            $latestLivePoint['battery'],
+            $latestLivePoint['is_charging'],
+            $latestLivePoint['captured_at'],
+        ]);
+
+        $liveUpdated = true;
+
+        if ($latestLivePoint['battery'] !== null) {
+            $userBatteryStmt->execute([
+                $latestLivePoint['battery'],
+                $latestLivePoint['is_charging'],
+                $technicianId
+            ]);
+        }
+    }
+
+    $pdo->commit();
+
+    respond_with_json([
+        'success' => true,
+        'message' => 'Tracking payload processed',
+        'job_id' => $jobId,
+        'session_id' => $sessionId,
+        'history_saved' => $savedPoints > 0,
+        'saved_points' => $savedPoints,
+        'duplicate_points' => $duplicatePoints,
+        'invalid_points' => $invalidPoints,
+        'received_points' => $receivedPoints,
+        'live_updated' => $liveUpdated,
+        'history_only' => $historyOnlyMode,
+    ]);
+} catch (Throwable $exception) {
+    if ($pdo->inTransaction()) {
+        $pdo->rollBack();
+    }
+
+    error_log($exception->getMessage());
+
+    respond_with_json([
+        'success' => false,
+        'message' => 'Unable to track location'
+    ], 500);
+}
