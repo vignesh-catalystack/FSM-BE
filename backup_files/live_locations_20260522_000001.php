@@ -6,10 +6,8 @@ require_once __DIR__ . '/../middleware/auth.php';
 require_once __DIR__ . '/../jobs/helpers.php';
 
 enforce_method('GET');
-
 $user = authenticate($pdo);
 ensureDeletedJobsTable($pdo);
-
 $requestedTechnicianId = query_int_value('technician_id');
 $requestedJobId        = query_int_value('job_id');
 
